@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""tokenplan - pace Claude and Codex subscription usage until the weekly reset.
+
+Data sources (live, read-only):
+  Claude: GET https://api.anthropic.com/api/oauth/usage  (OAuth token from macOS keychain)
+  Codex:  GET https://chatgpt.com/backend-api/wham/usage (token from ~/.codex/auth.json)
+
+Both providers only expose usage as a percentage of each limit, so every budget
+here is expressed in "% of the weekly limit".
+
+Commands:
+  tokenplan                 status report (default)
+  tokenplan line            one-line summary for status bars
+  tokenplan json            machine-readable report
+  tokenplan tick            snapshot + scheduled window triggers + alerts (run by launchd)
+  tokenplan trigger [p]     start a 5h window now if none active (p = claude|codex|all)
+  tokenplan install         install the launchd agent (tick every 15 min)
+  tokenplan uninstall       remove the launchd agent
+  tokenplan config          print config path and effective config
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "tokenplan" / "config.toml"
+STATE_DIR = HOME / ".local" / "state" / "tokenplan"
+HISTORY = STATE_DIR / "history.jsonl"
+STATE_FILE = STATE_DIR / "state.json"
+LOG_FILE = STATE_DIR / "tick.log"
+PLIST = HOME / "Library" / "LaunchAgents" / "com.tokenplan.tick.plist"
+UA = "tokenplan/1.0"
+
+
+def system_tz():
+    """Use the macOS system zone, ignoring a TZ override in the shell (e.g. TZ=UTC)."""
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo(os.readlink("/etc/localtime").split("zoneinfo/", 1)[1])
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
+LOCAL_TZ = system_tz()
+
+DEFAULT_CONFIG = """\
+# tokenplan configuration. Times are local, 24h "HH:MM".
+
+[general]
+# Hours you actually work. Budgets are spread over these hours only.
+# day_end earlier than day_start means the day crosses midnight.
+day_start = "08:00"
+day_end = "01:00"
+# Percent of the weekly limit kept untouched as a safety margin until reset.
+reserve_pct = 3
+# When stretching today, every later day keeps at least this share of an even day.
+min_future_day_share = 0.5
+# Send a macOS notification when today's spend passes today's budget.
+notify_over_budget = true
+
+[claude]
+enabled = true
+# Start a 5h window at these times (only if no window is active).
+# Chain them 5h apart so windows roll over back to back through the work day.
+trigger_times = ["07:00", "12:00", "17:00", "22:00"]
+# Binary names are resolved via PATH (plus ~/.local/bin, Homebrew); absolute paths also work.
+trigger_cmd = ["claude", "-p", "Reply with OK only.", "--model", "haiku"]
+
+[codex]
+enabled = true
+# Used only when Codex reports a 5h window (prolite currently has weekly only).
+trigger_times = ["07:00", "12:00", "17:00", "22:00"]
+trigger_cmd = ["codex", "exec", "--skip-git-repo-check", "-c", "model_reasoning_effort=\\"low\\"", "Reply with OK only."]
+"""
+
+
+# ---------------------------------------------------------------- config/state
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(DEFAULT_CONFIG)
+    defaults = tomllib.loads(DEFAULT_CONFIG)
+    user = tomllib.loads(CONFIG_PATH.read_text())
+    for section, values in user.items():
+        defaults.setdefault(section, {}).update(values)
+    return defaults
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=1))
+
+
+def log(msg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a") as f:
+        f.write(f"{datetime.now(LOCAL_TZ).isoformat(timespec="seconds")} {msg}\n")
+
+
+def parse_hm(s):
+    h, m = s.split(":")
+    return int(h), int(m)
+
+
+# ---------------------------------------------------------------- fetchers
+
+def http_json(url, headers):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **headers})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def ts(v):
+    """Normalise ISO string or epoch seconds to an aware datetime."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v, timezone.utc)
+    return datetime.fromisoformat(v)
+
+
+def fetch_claude():
+    raw = subprocess.run(
+        ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+        capture_output=True, text=True,
+    ).stdout
+    if not raw:
+        return {"error": "no Claude Code credentials in keychain"}
+    oauth = json.loads(raw).get("claudeAiOauth", {})
+    try:
+        d = http_json(
+            "https://api.anthropic.com/api/oauth/usage",
+            {"Authorization": f"Bearer {oauth.get('accessToken')}", "anthropic-beta": "oauth-2025-04-20"},
+        )
+    except urllib.error.HTTPError as e:
+        hint = " (token expired: run any claude command to refresh)" if e.code == 401 else ""
+        return {"error": f"HTTP {e.code}{hint}"}
+    except Exception as e:
+        return {"error": str(e)}
+    fh, sd = d.get("five_hour") or {}, d.get("seven_day") or {}
+    return {
+        "plan": oauth.get("rateLimitTier") or oauth.get("subscriptionType"),
+        "week_used": float(sd.get("utilization") or 0),
+        "week_reset": ts(sd.get("resets_at")),
+        "has_5h": True,
+        "win_used": float(fh.get("utilization") or 0) if fh else None,
+        "win_reset": ts(fh.get("resets_at")) if fh else None,
+    }
+
+
+def fetch_codex():
+    try:
+        auth = json.loads((HOME / ".codex" / "auth.json").read_text())["tokens"]
+        d = http_json(
+            "https://chatgpt.com/backend-api/wham/usage",
+            {"Authorization": f"Bearer {auth['access_token']}", "ChatGPT-Account-Id": auth["account_id"]},
+        )
+    except urllib.error.HTTPError as e:
+        hint = " (token expired: run codex once to refresh)" if e.code == 401 else ""
+        return {"error": f"HTTP {e.code}{hint}"}
+    except Exception as e:
+        return {"error": str(e)}
+    rl = d.get("rate_limit") or {}
+    wins = [w for w in (rl.get("primary_window"), rl.get("secondary_window")) if w]
+    week = next((w for w in wins if w["limit_window_seconds"] >= 6 * 86400), None)
+    short = next((w for w in wins if w["limit_window_seconds"] <= 6 * 3600), None)
+    out = {"plan": d.get("plan_type"), "has_5h": short is not None,
+           "credits": (d.get("credits") or {}).get("balance")}
+    if week:
+        out["week_used"] = float(week["used_percent"])
+        out["week_reset"] = ts(week["reset_at"])
+    else:
+        out["error"] = "no weekly window reported"
+    if short:
+        out["win_used"] = float(short["used_percent"])
+        out["win_reset"] = ts(short["reset_at"])
+    return out
+
+
+FETCHERS = {"claude": fetch_claude, "codex": fetch_codex}
+
+
+# ---------------------------------------------------------------- active-hour math
+
+def active_intervals(start, end, cfg):
+    """Yield (a, b) local datetimes where work hours overlap [start, end]."""
+    sh, sm = parse_hm(cfg["general"]["day_start"])
+    eh, em = parse_hm(cfg["general"]["day_end"])
+    day = (start - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    while day <= end:
+        a = day.replace(hour=sh, minute=sm)
+        b = day.replace(hour=eh, minute=em)
+        if b <= a:
+            b += timedelta(days=1)
+        lo, hi = max(a, start), min(b, end)
+        if hi > lo:
+            yield lo, hi
+        day += timedelta(days=1)
+
+
+def active_hours(start, end, cfg):
+    return sum((b - a).total_seconds() for a, b in active_intervals(start, end, cfg)) / 3600
+
+
+def logical_day_bounds(now, cfg):
+    """Start and end of the work day containing `now` (or the next one if off-hours)."""
+    sh, sm = parse_hm(cfg["general"]["day_start"])
+    eh, em = parse_hm(cfg["general"]["day_end"])
+    for offset in (-1, 0, 1):
+        d = (now + timedelta(days=offset)).replace(hour=sh, minute=sm, second=0, microsecond=0)
+        e = d.replace(hour=eh, minute=em)
+        if e <= d:
+            e += timedelta(days=1)
+        if now < e:
+            return d, e
+    raise RuntimeError("unreachable")
+
+
+# ---------------------------------------------------------------- history
+
+def append_history(name, data, now):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"t": now.isoformat(), "p": name, "week": data["week_used"],
+           "week_reset": data["week_reset"].isoformat()}
+    if data.get("win_used") is not None:
+        rec["win"] = data["win_used"]
+        rec["win_reset"] = data["win_reset"].isoformat() if data.get("win_reset") else None
+    with HISTORY.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def read_history(name):
+    if not HISTORY.exists():
+        return []
+    out = []
+    for line in HISTORY.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("p") == name:
+            r["t"] = datetime.fromisoformat(r["t"])
+            out.append(r)
+    return out
+
+
+def used_at(history, when, week_reset):
+    """Weekly % at `when`: last snapshot at or before it within the same weekly window."""
+    best = None
+    for r in history:
+        if r["week_reset"] != week_reset.isoformat():
+            continue
+        if r["t"] <= when:
+            best = r
+    return best["week"] if best else None
+
+
+def window_cost_ratio(history):
+    """Weekly-% consumed per 1% of the 5h window, learned from consecutive snapshots."""
+    dw = ds = 0.0
+    for a, b in zip(history, history[1:]):
+        if a.get("win") is None or b.get("win") is None:
+            continue
+        if a["week_reset"] != b["week_reset"] or a.get("win_reset") != b.get("win_reset"):
+            continue
+        dwin, dweek = b["win"] - a["win"], b["week"] - a["week"]
+        if dwin > 0 and dweek >= 0:
+            ds += dwin
+            dw += dweek
+    return dw / ds if ds >= 20 else None
+
+
+# ---------------------------------------------------------------- planning
+
+def plan(name, data, cfg, now):
+    g = cfg["general"]
+    reserve = float(g["reserve_pct"])
+    reset = data["week_reset"].astimezone(LOCAL_TZ)
+    week_start = reset - timedelta(days=7)
+    used = data["week_used"]
+    remaining = max(0.0, 100 - reserve - used)
+
+    a_total = active_hours(now, reset, cfg)
+    day_start, day_end = logical_day_bounds(now, cfg)
+    a_today = active_hours(now, min(day_end, reset), cfg)
+    a_week = active_hours(week_start, reset, cfg)
+    rate = remaining / a_total if a_total > 0 else remaining
+
+    left_today = rate * a_today
+    history = read_history(name)
+    base = used_at(history, max(day_start, week_start), data["week_reset"])
+    if base is None and day_start <= week_start:
+        base = 0.0
+    spent_today = used - base if base is not None else None
+
+    # Even linear pace over all work hours of the week.
+    expected = (100 - reserve) * active_hours(week_start, now, cfg) / a_week if a_week else 0
+    bank = expected - used
+
+    # Next work day, if it starts before the reset.
+    nd_start, nd_end = logical_day_bounds(day_end + timedelta(minutes=1), cfg)
+    a_next = active_hours(nd_start, min(nd_end, reset), cfg)
+    a_after_today = a_total - a_today
+    share = float(g["min_future_day_share"])
+    stretch_today = max(0.0, remaining - share * rate * a_after_today) if a_after_today > 0 else remaining
+    tomorrow_on_plan = rate * a_next
+    tomorrow_if_stop = (remaining / a_after_today * a_next) if a_after_today > 0 else 0.0
+    tomorrow_if_stretch = (share * rate * a_next) if a_after_today > 0 else 0.0
+
+    out = {
+        "provider": name, "plan": data.get("plan"),
+        "week_used": used, "reserve": reserve, "remaining": remaining,
+        "reset": reset, "hours_to_reset": (reset - now).total_seconds() / 3600,
+        "work_hours_left": a_total, "work_hours_today": a_today,
+        "rate_per_work_hour": rate, "expected_now": expected, "bank": bank,
+        "spent_today": spent_today, "left_today": left_today,
+        "today_budget": (spent_today + left_today) if spent_today is not None else None,
+        "stretch_today": stretch_today, "tomorrow_on_plan": tomorrow_on_plan,
+        "tomorrow_if_stop": tomorrow_if_stop, "tomorrow_if_stretch": tomorrow_if_stretch,
+        "next_day_reset_before": nd_start < reset,
+        "has_5h": data.get("has_5h"), "credits": data.get("credits"),
+    }
+    if data.get("win_used") is not None:
+        win_reset = data["win_reset"].astimezone(LOCAL_TZ) if data.get("win_reset") else None
+        active = win_reset is not None and win_reset > now
+        out.update(win_used=data["win_used"] if active else 0.0, win_reset=win_reset, win_active=active)
+        ratio = window_cost_ratio(history)
+        out["win_ratio"] = ratio
+        if active:
+            win_hours = active_hours(now, win_reset, cfg)
+            out["win_budget"] = min(left_today, rate * max(win_hours, 0.0) + max(bank, 0))
+    out["next_trigger"] = next_trigger(name, cfg, now) if data.get("has_5h") else None
+    return out
+
+
+def next_trigger(name, cfg, now):
+    times = cfg.get(name, {}).get("trigger_times") or []
+    cands = []
+    for t in times:
+        h, m = parse_hm(t)
+        c = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if c <= now:
+            c += timedelta(days=1)
+        cands.append(c)
+    return min(cands) if cands else None
+
+
+# ---------------------------------------------------------------- output
+
+def fmt_dt(d, now):
+    if d is None:
+        return "-"
+    delta = d - now
+    h = delta.total_seconds() / 3600
+    rel = f"{int(h)}h{int((h % 1) * 60):02d}m" if h < 48 else f"{h / 24:.1f}d"
+    day = "" if d.date() == now.date() else d.strftime("%a ")
+    return f"{day}{d:%H:%M} (in {rel})"
+
+
+def bar(pct, width=24):
+    pct = max(0.0, min(100.0, pct))
+    n = round(pct / 100 * width)
+    return "#" * n + "." * (width - n)
+
+
+def report(plans, errors, now):
+    lines = [f"tokenplan  {now:%a %d %b %H:%M}  (units: % of weekly limit)", ""]
+    for p in plans:
+        title = f"{p['provider'].upper()}  [{p['plan']}]"
+        lines.append(title)
+        lines.append(f"  week    [{bar(p['week_used'])}] {p['week_used']:.0f}% used, "
+                     f"{p['remaining']:.0f}% spendable (reserve {p['reserve']:.0f}%)")
+        lines.append(f"  reset   {fmt_dt(p['reset'], now)}  |  {p['work_hours_left']:.1f} work hours left")
+        sign = "ahead (banked)" if p["bank"] >= 0 else "BEHIND (overspent)"
+        lines.append(f"  pace    should be at {p['expected_now']:.0f}%, you are {abs(p['bank']):.1f}% {sign}")
+        if p["spent_today"] is not None:
+            over = p["spent_today"] - p["today_budget"]
+            status = f"  OVER by {over:.1f}%" if over > 0.05 else ""
+            lines.append(f"  today   budget {p['today_budget']:.1f}%  spent {p['spent_today']:.1f}%  "
+                         f"left {p['left_today']:.1f}%{status}")
+        else:
+            lines.append(f"  today   left {p['left_today']:.1f}% for {p['work_hours_today']:.1f} work hours "
+                         f"(spent-today unknown until first snapshot of the day)")
+        lines.append(f"  rate    {p['rate_per_work_hour']:.2f}%/work hour")
+        if p["next_day_reset_before"]:
+            lines.append(f"  stretch can spend up to {p['stretch_today']:.1f}% more today "
+                         f"(later days drop to {p['tomorrow_if_stretch']:.1f}%/day)")
+            lines.append(f"  carry   tomorrow on plan {p['tomorrow_on_plan']:.1f}%  |  "
+                         f"stop now: {p['tomorrow_if_stop']:.1f}%")
+        else:
+            lines.append("  final   weekly reset before next work day: use it all today")
+        if p.get("win_used") is not None:
+            if p["win_active"]:
+                wb = p.get("win_budget")
+                lines.append(f"  5h win  [{bar(p['win_used'])}] {p['win_used']:.0f}% used, resets "
+                             f"{fmt_dt(p['win_reset'], now)}"
+                             + (f"  | spend <= {wb:.1f}% weekly here" if wb is not None else ""))
+            else:
+                lines.append("  5h win  idle (next message starts a fresh window)")
+            if p.get("win_ratio"):
+                lines.append(f"          full 5h window ~ {p['win_ratio'] * 100:.0f}% weekly (learned)")
+        elif p["has_5h"] is False:
+            lines.append("  5h win  none on this plan (weekly limit only)")
+        if p.get("next_trigger"):
+            lines.append(f"  trigger next auto-start {fmt_dt(p['next_trigger'], now)}")
+        if p.get("credits"):
+            lines.append(f"  credits {float(p['credits']):.0f} balance")
+        lines.append("")
+    for name, err in errors.items():
+        lines.append(f"{name.upper()}  error: {err}")
+    return "\n".join(lines).rstrip()
+
+
+def one_line(plans, errors, now):
+    parts = []
+    for p in plans:
+        tag = {"claude": "Cl", "codex": "Cx"}.get(p["provider"], p["provider"])
+        today = (f"{p['spent_today']:.0f}/{p['today_budget']:.0f}%" if p["spent_today"] is not None
+                 else f"left {p['left_today']:.0f}%")
+        s = f"{tag} wk {p['week_used']:.0f}% day {today} {'+' if p['bank'] >= 0 else ''}{p['bank']:.0f}"
+        if p.get("win_active"):
+            s += f" 5h {p['win_used']:.0f}%>{p['win_reset']:%H:%M}"
+        parts.append(s)
+    parts += [f"{n} err" for n in errors]
+    return " | ".join(parts)
+
+
+# ---------------------------------------------------------------- actions
+
+def notify(title, msg):
+    subprocess.run(["osascript", "-e", f'display notification {json.dumps(msg)} with title {json.dumps(title)}'],
+                   capture_output=True)
+
+
+def run_trigger(name, cfg):
+    cmd = [os.path.expanduser(c) for c in cfg[name]["trigger_cmd"]]
+    # Drop proxy overrides so the trigger hits the real API and counts against the subscription.
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_BASE_URL"}
+    env["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{env.get('PATH', '')}"
+    exe = shutil.which(cmd[0], path=env["PATH"])
+    if not exe:
+        log(f"trigger {name}: {cmd[0]!r} not found in PATH")
+        return False
+    cmd[0] = exe
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(cmd, cwd=STATE_DIR, env=env, capture_output=True, text=True, timeout=180,
+                       stdin=subprocess.DEVNULL)
+    log(f"trigger {name} rc={r.returncode} out={r.stdout.strip()[:80]!r} err={r.stderr.strip()[-200:]!r}")
+    return r.returncode == 0
+
+
+def collect(cfg, now, record=False):
+    plans, errors, raw = [], {}, {}
+    for name, fetch in FETCHERS.items():
+        if not cfg.get(name, {}).get("enabled", True):
+            continue
+        data = fetch()
+        if data.get("error"):
+            errors[name] = data["error"]
+            continue
+        raw[name] = data
+        if record:
+            append_history(name, data, now)
+        plans.append(plan(name, data, cfg, now))
+    return plans, errors, raw
+
+
+def ensure_snapshot_today(cfg, now):
+    """Record a snapshot if none exists yet for the current work day (keeps 'spent today' accurate)."""
+    day_start, _ = logical_day_bounds(now, cfg)
+    for name in FETCHERS:
+        hist = read_history(name)
+        if not hist or hist[-1]["t"] < day_start:
+            return True
+    return False
+
+
+def cmd_tick(cfg):
+    now = datetime.now(LOCAL_TZ)
+    plans, errors, raw = collect(cfg, now, record=True)
+    state = load_state()
+    fired = state.setdefault("fired", {})
+    for name, data in raw.items():
+        if not data.get("has_5h"):
+            continue
+        win_active = data.get("win_reset") is not None and data["win_reset"] > now
+        for t in cfg[name].get("trigger_times", []):
+            h, m = parse_hm(t)
+            slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if slot > now:
+                slot -= timedelta(days=1)
+            key = f"{name}@{slot.isoformat()}"
+            if now - slot > timedelta(minutes=90) or key in fired:
+                continue
+            fired[key] = True
+            if win_active:
+                log(f"skip {key}: window active until {data['win_reset'].astimezone(LOCAL_TZ):%H:%M}")
+                continue
+            ok = run_trigger(name, cfg)
+            notify("tokenplan", f"{name}: 5h window {'started' if ok else 'trigger FAILED'} at {now:%H:%M}")
+    cutoff = (now - timedelta(days=3)).isoformat()
+    state["fired"] = {k: v for k, v in fired.items() if k.split("@", 1)[1] > cutoff}
+
+    if cfg["general"].get("notify_over_budget"):
+        warned = state.setdefault("warned", {})
+        day_key = logical_day_bounds(now, cfg)[0].date().isoformat()
+        for p in plans:
+            k = f"{p['provider']}@{day_key}"
+            if p["spent_today"] is not None and p["spent_today"] > p["today_budget"] + 0.5 and k not in warned:
+                warned[k] = True
+                notify("tokenplan", f"{p['provider']}: today {p['spent_today']:.1f}% > budget "
+                                    f"{p['today_budget']:.1f}%. Stretch limit {p['stretch_today']:.1f}%.")
+        state["warned"] = {k: v for k, v in warned.items() if k.split("@")[1] >= (now - timedelta(days=3)).date().isoformat()}
+    save_state(state)
+    for n, e in errors.items():
+        log(f"error {n}: {e}")
+
+
+def cmd_trigger(cfg, which):
+    now = datetime.now(LOCAL_TZ)
+    names = list(FETCHERS) if which in (None, "all") else [which]
+    for name in names:
+        data = FETCHERS[name]()
+        if data.get("error"):
+            print(f"{name}: {data['error']}")
+            continue
+        if not data.get("has_5h"):
+            print(f"{name}: no 5h window on this plan, nothing to trigger")
+            continue
+        if data.get("win_reset") and data["win_reset"] > now:
+            print(f"{name}: window already active until {data['win_reset'].astimezone(LOCAL_TZ):%H:%M}")
+            continue
+        print(f"{name}: starting window... {'ok' if run_trigger(name, cfg) else 'FAILED (see ' + str(LOG_FILE) + ')'}")
+
+
+def cmd_install():
+    py = sys.executable or shutil.which("python3") or "/usr/bin/python3"
+    script = str(Path(__file__).resolve())
+    PLIST.parent.mkdir(parents=True, exist_ok=True)
+    PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.tokenplan.tick</string>
+  <key>ProgramArguments</key><array><string>{py}</string><string>{script}</string><string>tick</string></array>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{STATE_DIR}/launchd.out</string>
+  <key>StandardErrorPath</key><string>{STATE_DIR}/launchd.err</string>
+</dict></plist>
+""")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(PLIST)], capture_output=True)
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(PLIST)], capture_output=True, text=True)
+    print(f"installed {PLIST}" if r.returncode == 0 else f"launchctl failed: {r.stderr}")
+
+
+def cmd_uninstall():
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(PLIST)], capture_output=True)
+    PLIST.unlink(missing_ok=True)
+    print("uninstalled")
+
+
+def main():
+    cfg = load_config()
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+    now = datetime.now(LOCAL_TZ)
+    if cmd in ("status", "line", "json"):
+        record = ensure_snapshot_today(cfg, now)
+        plans, errors, _ = collect(cfg, now, record=record)
+        if cmd == "status":
+            print(report(plans, errors, now))
+        elif cmd == "line":
+            print(one_line(plans, errors, now))
+        else:
+            print(json.dumps({"plans": plans, "errors": errors}, default=str, indent=1))
+    elif cmd == "tick":
+        cmd_tick(cfg)
+    elif cmd == "trigger":
+        cmd_trigger(cfg, args[1] if len(args) > 1 else None)
+    elif cmd == "install":
+        cmd_install()
+    elif cmd == "uninstall":
+        cmd_uninstall()
+    elif cmd == "config":
+        print(CONFIG_PATH)
+        print(CONFIG_PATH.read_text())
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
