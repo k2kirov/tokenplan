@@ -90,6 +90,7 @@ day_end = "01:00"            # earlier than day_start = crosses midnight
 reserve_pct = 3              # % of the week kept untouched as a safety margin
 min_future_day_share = 0.5   # when stretching, later days keep >= 50% of an even day
 notify_over_budget = true    # macOS notification when today's spend passes the budget
+trigger_grace_minutes = 120  # how long a trigger slot waits for a running window to end / the Mac to wake
 
 [claude]
 enabled = true
@@ -102,7 +103,13 @@ trigger_times = ["07:00", "12:00", "17:00", "22:00"]
 trigger_cmd = ["codex", "exec", "--skip-git-repo-check", "-c", "model_reasoning_effort=\"low\"", "Reply with OK only."]
 ```
 
-**Choosing trigger times:** space them 5 hours apart and start the first one a little before you begin work. Your first window is then already running when you sit down, and a fresh one is ready when it runs out. A trigger is skipped if a window is already active. A trigger missed by up to 90 minutes (for example, the Mac was asleep) still fires when the next tick runs.
+**Choosing trigger times:** space them 5 hours apart and start the first one a little before you begin work. Your first window is then already running when you sit down, and a fresh one is ready when it runs out. If a window is still running at a trigger time, the trigger waits and fires on the first tick after the window ends, so windows run back to back. A trigger missed while the Mac was asleep fires on wake. Both are limited by `trigger_grace_minutes` (default 120).
+
+To have the Mac awake for the first trigger, schedule a daily wake a few minutes before it:
+
+```sh
+sudo pmset repeat wakeorpoweron MTWRFSU 06:55:00
+```
 
 ## How it works
 
@@ -133,6 +140,8 @@ Unspent budget is automatically spread over the remaining days, because the rate
 ## Notes
 
 - **Unattended triggers need a long-lived Claude token.** OAuth sign-ins expire. Run `claude setup-token`, then `tokenplan set-token` and paste the token (input hidden). It is stored in the Keychain as `tokenplan-claude-oauth` and passed to the trigger as `CLAUDE_CODE_OAUTH_TOKEN`. Usage reading still uses your normal Claude Code sign-in.
+- **Sign-in problems are reported.** If usage can't be read, you get a macOS notification (at most every 6 hours) saying what to do. For Claude, run `claude auth login` before the sign-in expires.
+- **Codex refreshes itself.** When the Codex token expires, tokenplan runs one tiny `codex exec` (about 25k tokens, at most every 6 hours) so the official client refreshes its own sign-in. tokenplan never writes `~/.codex/auth.json`.
 - Codex plans without a 5h window (weekly only) skip triggering automatically, and it turns back on if the plan reports one.
 - `ANTHROPIC_BASE_URL` is removed from the trigger environment so local proxies don't intercept the call.
 - The shell's `TZ` is ignored. Times use the macOS system time zone.

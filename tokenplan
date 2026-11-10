@@ -67,6 +67,9 @@ reserve_pct = 3
 min_future_day_share = 0.5
 # Send a macOS notification when today's spend passes today's budget.
 notify_over_budget = true
+# A trigger slot stays pending this long: it waits for a running window to end, and
+# still fires after the Mac wakes from sleep.
+trigger_grace_minutes = 120
 
 [claude]
 enabled = true
@@ -542,7 +545,9 @@ def cmd_tick(cfg):
     now = datetime.now(LOCAL_TZ)
     plans, errors, raw = collect(cfg, now, record=True)
     state = load_state()
+    heal_codex(cfg, now, state, plans, errors, raw)
     fired = state.setdefault("fired", {})
+    grace = timedelta(minutes=float(cfg["general"].get("trigger_grace_minutes", 120)))
     for name, data in raw.items():
         if not data.get("has_5h"):
             continue
@@ -553,14 +558,17 @@ def cmd_tick(cfg):
             if slot > now:
                 slot -= timedelta(days=1)
             key = f"{name}@{slot.isoformat()}"
-            if now - slot > timedelta(minutes=90) or key in fired:
+            # A slot stays pending for the whole grace period: if a window is still running
+            # at the slot time, the trigger fires on the first tick after it ends, so windows
+            # chain back to back. A missed slot (Mac asleep) also fires on wake within grace.
+            if now - slot > grace or key in fired:
+                continue
+            if win_active:
                 continue
             fired[key] = True
-            if win_active:
-                log(f"skip {key}: window active until {data['win_reset'].astimezone(LOCAL_TZ):%H:%M}")
-                continue
             ok = run_trigger(name, cfg)
             notify("tokenplan", f"{name}: 5h window {'started' if ok else 'trigger FAILED'} at {now:%H:%M}")
+            break
     cutoff = (now - timedelta(days=3)).isoformat()
     state["fired"] = {k: v for k, v in fired.items() if k.split("@", 1)[1] > cutoff}
 
@@ -574,9 +582,57 @@ def cmd_tick(cfg):
                 notify("tokenplan", f"{p['provider']}: today {p['spent_today']:.1f}% > budget "
                                     f"{p['today_budget']:.1f}%. Stretch limit {p['stretch_today']:.1f}%.")
         state["warned"] = {k: v for k, v in warned.items() if k.split("@")[1] >= (now - timedelta(days=3)).date().isoformat()}
+    notify_errors(errors, now, state)
     save_state(state)
     for n, e in errors.items():
         log(f"error {n}: {e}")
+
+
+ERROR_HINTS = {
+    "claude": "Run `claude auth login` to sign in again.",
+    "codex": "Run `codex` once to refresh its sign-in.",
+}
+
+
+def notify_errors(errors, now, state):
+    """Notify about fetch errors at most once every 6 hours per provider."""
+    last = state.setdefault("error_notified", {})
+    for name, err in errors.items():
+        prev = last.get(name)
+        if prev and now - datetime.fromisoformat(prev) < timedelta(hours=6):
+            continue
+        last[name] = now.isoformat()
+        hint = ERROR_HINTS.get(name, "") if "401" in err else ""
+        notify("tokenplan", f"{name} usage unavailable: {err}. {hint}".strip())
+    for name in list(last):
+        if name not in errors:
+            del last[name]
+
+
+def heal_codex(cfg, now, state, plans, errors, raw):
+    """On an expired Codex token, run Codex once so it refreshes its own sign-in.
+
+    tokenplan never writes ~/.codex/auth.json itself: refresh tokens rotate, and a
+    half-written file would log Codex out. One tiny `codex exec` (~25k tokens) lets the
+    official client do the refresh. Attempts are limited to one every 6 hours.
+    """
+    err = errors.get("codex", "")
+    if "401" not in err or not cfg.get("codex", {}).get("enabled", True):
+        return
+    prev = state.get("codex_heal")
+    if prev and now - datetime.fromisoformat(prev) < timedelta(hours=6):
+        return
+    state["codex_heal"] = now.isoformat()
+    log("codex token expired, running codex once to refresh it")
+    run_trigger("codex", cfg)
+    data = fetch_codex()
+    if data.get("error"):
+        errors["codex"] = data["error"]
+        return
+    errors.pop("codex", None)
+    raw["codex"] = data
+    append_history("codex", data, now)
+    plans.append(plan("codex", data, cfg, now))
 
 
 def cmd_trigger(cfg, which):
