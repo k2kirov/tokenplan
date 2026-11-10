@@ -57,6 +57,7 @@ tokenplan line [--color]     # one line, for status bars
 tokenplan json               # machine-readable
 tokenplan trigger [claude|codex]   # start a 5h window now (skipped if one is active)
 tokenplan config             # show config path and contents
+tokenplan set-token          # store a `claude setup-token` token for unattended triggers
 tokenplan install|uninstall  # manage the launchd agent
 ```
 
@@ -131,7 +132,7 @@ Unspent budget is automatically spread over the remaining days, because the rate
 
 ## Notes
 
-- **Unattended triggers need a long-lived Claude token.** OAuth sign-ins expire. Run `claude setup-token` so launchd triggers keep working.
+- **Unattended triggers need a long-lived Claude token.** OAuth sign-ins expire. Run `claude setup-token`, then `tokenplan set-token` and paste the token (input hidden). It is stored in the Keychain as `tokenplan-claude-oauth` and passed to the trigger as `CLAUDE_CODE_OAUTH_TOKEN`. Usage reading still uses your normal Claude Code sign-in.
 - Codex plans without a 5h window (weekly only) skip triggering automatically, and it turns back on if the plan reports one.
 - `ANTHROPIC_BASE_URL` is removed from the trigger environment so local proxies don't intercept the call.
 - The shell's `TZ` is ignored. Times use the macOS system time zone.

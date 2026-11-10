@@ -14,6 +14,7 @@ Commands:
   tokenplan json            machine-readable report
   tokenplan tick            snapshot + scheduled window triggers + alerts (run by launchd)
   tokenplan trigger [p]     start a 5h window now if none active (p = claude|codex|all)
+  tokenplan set-token       store a `claude setup-token` token for unattended triggers
   tokenplan install         install the launchd agent (tick every 15 min)
   tokenplan uninstall       remove the launchd agent
   tokenplan config          print config path and effective config
@@ -466,6 +467,28 @@ def notify(title, msg):
                    capture_output=True)
 
 
+CLAUDE_TOKEN_ITEM = "tokenplan-claude-oauth"
+
+
+def keychain_get(service):
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def cmd_set_token():
+    """Store a `claude setup-token` token in the Keychain without echoing it."""
+    import getpass
+    tok = getpass.getpass("Paste the token from `claude setup-token` (input hidden): ").strip()
+    if not tok.startswith("sk-ant-"):
+        print("that does not look like a Claude OAuth token (expected sk-ant-...)")
+        sys.exit(1)
+    r = subprocess.run(["security", "add-generic-password", "-U", "-s", CLAUDE_TOKEN_ITEM,
+                        "-a", os.environ.get("USER", "tokenplan"), "-w", tok],
+                       capture_output=True, text=True)
+    print("stored in Keychain as " + CLAUDE_TOKEN_ITEM if r.returncode == 0 else f"failed: {r.stderr}")
+
+
 def run_trigger(name, cfg):
     cmd = [os.path.expanduser(c) for c in cfg[name]["trigger_cmd"]]
     # Drop proxy overrides so the trigger hits the real API and counts against the subscription.
@@ -476,6 +499,12 @@ def run_trigger(name, cfg):
         log(f"trigger {name}: {cmd[0]!r} not found in PATH")
         return False
     cmd[0] = exe
+    if name == "claude":
+        # Prefer the long-lived token from `claude setup-token` (stored in the Keychain by
+        # `tokenplan set-token`); regular OAuth sign-ins expire and break unattended runs.
+        tok = keychain_get(CLAUDE_TOKEN_ITEM)
+        if tok:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(cmd, cwd=STATE_DIR, env=env, capture_output=True, text=True, timeout=180,
                        stdin=subprocess.DEVNULL)
@@ -613,6 +642,8 @@ def main():
         cmd_tick(cfg)
     elif cmd == "trigger":
         cmd_trigger(cfg, args[1] if len(args) > 1 else None)
+    elif cmd == "set-token":
+        cmd_set_token()
     elif cmd == "install":
         cmd_install()
     elif cmd == "uninstall":
