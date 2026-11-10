@@ -1,0 +1,25 @@
+{
+  "name": "tokenplan",
+  "version": "1.0.0",
+  "description": "Docs tooling for tokenplan (the tool itself is Python, see README)",
+  "scripts": {
+    "lint:docs": "docs-notary check",
+    "lint:docs:advisory": "docs-notary advisory",
+    "gen:docs-index": "docs-notary gen",
+    "docs:impact": "docs-notary impact"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/k2kirov/tokenplan.git"
+  },
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/k2kirov/tokenplan/issues"
+  },
+  "homepage": "https://github.com/k2kirov/tokenplan#readme",
+  "devDependencies": {
+    "@puralex/docs-notary": "^1.5.2"
+  },
+  "private": true
+}

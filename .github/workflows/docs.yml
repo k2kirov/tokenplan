@@ -1,0 +1,27 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # check --base and impact need full history.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Docs gate
+        run: npm run lint:docs
+      - name: Docs gate (history-aware)
+        if: github.event_name == 'pull_request'
+        run: npx docs-notary check --format github --base origin/${{ github.base_ref }}
+      - name: Documents affected by this change
+        if: github.event_name == 'pull_request'
+        run: npx docs-notary impact --base origin/${{ github.base_ref }} >> "$GITHUB_STEP_SUMMARY"

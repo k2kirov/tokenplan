@@ -1,0 +1,84 @@
+{
+  "generated": "scripts/gen-docs-index.mjs",
+  "count": 9,
+  "docs": [
+    {
+      "path": "docs/engineering/adr/0001-long-lived-token-for-triggers.md",
+      "title": "ADR 0001: Long-lived Claude token for unattended triggers",
+      "summary": "Window triggers authenticate with a claude setup-token token from the Keychain instead of the interactive sign-in",
+      "kind": "adr",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/engineering/adr/0002-never-write-codex-auth.md",
+      "title": "ADR 0002: Never write the Codex auth file",
+      "summary": "On an expired Codex token tokenplan runs Codex once to refresh itself instead of refreshing the token directly",
+      "kind": "adr",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/engineering/architecture.md",
+      "title": "Architecture",
+      "summary": "Components, data flow and on-disk files of tokenplan",
+      "kind": "engineering",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/engineering/budget-model.md",
+      "title": "Budget model",
+      "summary": "How tokenplan turns weekly usage into today's budget, pace, stretch and carry, with the exact formulas",
+      "kind": "engineering",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/engineering/data-sources.md",
+      "title": "Data sources",
+      "summary": "The two undocumented usage endpoints tokenplan reads, how it authenticates to each, and how they fail",
+      "kind": "engineering",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/engineering/runbooks/auth-renewal.md",
+      "title": "Renewing sign-ins",
+      "summary": "Steps to restore usage reading and window triggers when a Claude or Codex sign-in expires",
+      "kind": "runbook",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/engineering/runbooks/troubleshooting.md",
+      "title": "Troubleshooting",
+      "summary": "Diagnosing a missing status line, triggers that do not fire, wrong times and launchd problems",
+      "kind": "runbook",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/engineering/triggers.md",
+      "title": "Window triggers and the tick",
+      "summary": "How the launchd tick starts 5h windows at configured times, chains them back to back, and raises notifications",
+      "kind": "engineering",
+      "status": "active",
+      "updated": "2026-11-10"
+    },
+    {
+      "path": "docs/product/scope.md",
+      "title": "Product scope",
+      "summary": "What tokenplan does for the user, what it deliberately does not do, and the platforms it supports",
+      "kind": "product",
+      "status": "shipped",
+      "updated": "2026-11-10",
+      "code": "tokenplan"
+    }
+  ],
+  "by_code": {
+    "tokenplan": [
+      "docs/product/scope.md"
+    ]
+  }
+}

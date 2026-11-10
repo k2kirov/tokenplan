@@ -146,6 +146,11 @@ Unspent budget is automatically spread over the remaining days, because the rate
 - `ANTHROPIC_BASE_URL` is removed from the trigger environment so local proxies don't intercept the call.
 - The shell's `TZ` is ignored. Times use the macOS system time zone.
 
+## Documentation
+
+Design, budget formulas, data sources, decisions and runbooks live in [`docs/`](docs/README.md).
+Agents: start from [`docs/index.json`](docs/index.json).
+
 ## License
 
 MIT
