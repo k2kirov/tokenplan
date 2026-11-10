@@ -10,7 +10,7 @@ here is expressed in "% of the weekly limit".
 
 Commands:
   tokenplan                 status report (default)
-  tokenplan line            one-line summary for status bars
+  tokenplan line [--color] one-line summary for status bars (ANSI colors with --color)
   tokenplan json            machine-readable report
   tokenplan tick            snapshot + scheduled window triggers + alerts (run by launchd)
   tokenplan trigger [p]     start a 5h window now if none active (p = claude|codex|all)
@@ -428,18 +428,35 @@ def report(plans, errors, now):
     return "\n".join(lines).rstrip()
 
 
-def one_line(plans, errors, now):
+def one_line(plans, errors, now, color=False):
+    """Compact status: name, traffic light, % left today, pace arrow, 5h window."""
+    def c(code, text):
+        return f"\033[{code}m{text}\033[0m" if color else text
+
+    names = {"claude": ("Claude", "38;5;208"), "codex": ("Codex", "36")}
     parts = []
     for p in plans:
-        tag = {"claude": "Cl", "codex": "Cx"}.get(p["provider"], p["provider"])
-        today = (f"{p['spent_today']:.0f}/{p['today_budget']:.0f}%" if p["spent_today"] is not None
-                 else f"left {p['left_today']:.0f}%")
-        s = f"{tag} wk {p['week_used']:.0f}% day {today} {'+' if p['bank'] >= 0 else ''}{p['bank']:.0f}"
+        label, hue = names.get(p["provider"], (p["provider"], "37"))
+        left = p["left_today"]
+        spent, budget = p["spent_today"], p["today_budget"]
+        # Traffic light on today's budget: green on track, yellow nearly used, red over.
+        if spent is not None and budget:
+            used_share = spent / budget
+            light = "🔴" if used_share > 1 else "🟡" if used_share > 0.8 else "🟢"
+            left = budget - spent
+        else:
+            light = "🟢"
+        left_txt = c("31", f"{left:.0f}% over") if left < 0 else f"{left:.0f}% left today"
+        bank = p["bank"]
+        pace = c("32", f"▲{bank:.0f}") if bank >= 0 else c("31", f"▼{-bank:.0f}")
+        seg = f"{c(hue + ';1', label)} {light} {left_txt} {pace}"
         if p.get("win_active"):
-            s += f" 5h {p['win_used']:.0f}%>{p['win_reset']:%H:%M}"
-        parts.append(s)
-    parts += [f"{n} err" for n in errors]
-    return " | ".join(parts)
+            w = p["win_used"]
+            wc = "31" if w >= 90 else "33" if w >= 70 else "32"
+            seg += f" ⏳{c(wc, f'{w:.0f}%')}→{p['win_reset']:%H:%M}"
+        parts.append(seg)
+    parts += [f"{c('31', n + ' ⚠')}" for n in errors]
+    return c("90", "  │  ").join(parts)
 
 
 # ---------------------------------------------------------------- actions
@@ -589,7 +606,7 @@ def main():
         if cmd == "status":
             print(report(plans, errors, now))
         elif cmd == "line":
-            print(one_line(plans, errors, now))
+            print(one_line(plans, errors, now, color="--color" in args))
         else:
             print(json.dumps({"plans": plans, "errors": errors}, default=str, indent=1))
     elif cmd == "tick":

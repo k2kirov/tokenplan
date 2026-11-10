@@ -53,7 +53,7 @@ Remove everything with `./uninstall.sh`. Your config and history are kept.
 
 ```sh
 tokenplan                    # full report
-tokenplan line               # one line, for status bars
+tokenplan line [--color]     # one line, for status bars
 tokenplan json               # machine-readable
 tokenplan trigger [claude|codex]   # start a 5h window now (skipped if one is active)
 tokenplan config             # show config path and contents
@@ -65,9 +65,16 @@ tokenplan install|uninstall  # manage the launchd agent
 Claude Code `statusLine` command or tmux:
 
 ```sh
-tokenplan line
-# Cl wk 36% day 0/13% +26 5h 8%>21:30 | Cx wk 54% day 1/15% +21
+tokenplan line --color
+# Claude 🟢 23% left today ▲30 ⏳20%→12:09  │  Codex 🟢 35% left today ▲28
 ```
+
+- 🟢 / 🟡 / 🔴: today's budget is on track / over 80% used / exceeded
+- `23% left today`: % of the weekly limit still in today's budget
+- ▲30 (green) / ▼5 (red): % ahead of / behind an even weekly pace
+- ⏳20%→12:09: current 5h window usage (green/yellow/red at 70/90%) and its reset time
+
+Drop `--color` for plain text.
 
 It makes two network calls, so cache it if your status line refreshes often.
 
